@@ -11,9 +11,11 @@ Test:
     pytest
 """
 import json
+import math
 import re
 import sqlite3
 from contextlib import closing
+from decimal import Decimal
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -104,37 +106,76 @@ def get_recipe(recipe_id: int):
     return _row_to_recipe(row)
 
 
-# Leading quantity: mixed number ("1 1/2"), fraction ("1/2") or decimal/integer ("200", "0.5").
-_QUANTITY_RE = re.compile(r"^(\s*)(\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?|\.\d+)")
+# Scaling bounds, inclusive. Anything outside is rejected with HTTP 422 by query validation.
+MIN_SCALE_FACTOR = 0.001
+MAX_SCALE_FACTOR = 1000
+
+# A single quantity: mixed number ("1 1/2"), fraction ("1/2") or decimal/integer ("200", "0.5", ".5").
+# ASCII digits only, so lookalike Unicode digits are left alone.
+_NUMBER = r"[0-9]+\s+[0-9]+/[0-9]+|[0-9]+/[0-9]+|[0-9]+(?:\.[0-9]+)?|\.[0-9]+"
+# Leading quantity, optionally a range ("2-3", "1 – 2") with a hyphen, en dash or em dash.
+_QUANTITY_RE = re.compile(
+    rf"^(?P<lead>\s*)(?P<first>{_NUMBER})(?:(?P<sep>\s*[-–—]\s*)(?P<second>{_NUMBER}))?"
+)
 
 
-def _parse_quantity(text: str) -> float:
+def _parse_quantity(text: str) -> float | None:
+    """Parse '200', '0.5', '1/2' or '1 1/2' to a float; None if malformed (e.g. '1/0')."""
     total = 0.0
     for part in text.split():
         if "/" in part:
             num, den = part.split("/")
-            total += int(num) / int(den) if int(den) else 0.0
+            if float(den) == 0:
+                return None
+            total += float(num) / float(den)
         else:
             total += float(part)
     return total
 
 
 def _format_quantity(value: float) -> str:
-    rounded = round(value, 2)
-    return str(int(rounded)) if rounded == int(rounded) else f"{rounded:g}"
+    """Render without exponent, float noise or trailing zeros: 0.30000000000000004 -> '0.3'."""
+    text = format(Decimal(f"{value:.10g}"), "f")
+    return text.rstrip("0").rstrip(".") if "." in text else text
+
+
+def _scale_quantity(text: str, factor: float) -> str | None:
+    """Scale one quantity string and format it; None if it cannot be scaled safely."""
+    quantity = _parse_quantity(text)
+    if quantity is None:
+        return None
+    scaled = quantity * factor
+    return _format_quantity(scaled) if math.isfinite(scaled) else None
 
 
 def _scale_ingredient(ingredient: str, factor: float) -> str:
-    """Scale the leading quantity of an ingredient, e.g. '200 g flour' -> '400 g flour'."""
+    """Scale the leading quantity (or range) of an ingredient, e.g. '2-3 eggs' -> '4-6 eggs'.
+
+    Ingredients without a leading quantity, or with a malformed one such as '1/0 cup',
+    are returned unchanged.
+    """
     match = _QUANTITY_RE.match(ingredient)
     if match is None:
         return ingredient
-    scaled = _format_quantity(_parse_quantity(match.group(2)) * factor)
-    return f"{match.group(1)}{scaled}{ingredient[match.end():]}"
+    scaled = [_scale_quantity(match["first"], factor)]
+    if match["second"] is not None:
+        scaled.append(_scale_quantity(match["second"], factor))
+    if None in scaled:
+        return ingredient
+    quantity = (match["sep"] or "").join(scaled)
+    return f"{match['lead']}{quantity}{ingredient[match.end():]}"
 
 
 @app.get("/recipes/{recipe_id}/scaled")
-def get_scaled_recipe(recipe_id: int, factor: float = Query(gt=0, allow_inf_nan=False)):
+def get_scaled_recipe(
+    recipe_id: int,
+    factor: float = Query(ge=MIN_SCALE_FACTOR, le=MAX_SCALE_FACTOR, allow_inf_nan=False),
+):
+    """Return the recipe with leading ingredient quantities multiplied by `factor`.
+
+    The response has the recipe fields (`id`, `title`, `ingredients`, `tags`) plus
+    `factor`, the multiplier that was applied. The stored recipe is not modified.
+    """
     recipe = get_recipe(recipe_id)
     recipe["ingredients"] = [_scale_ingredient(i, factor) for i in recipe["ingredients"]]
     return {**recipe, "factor": factor}
