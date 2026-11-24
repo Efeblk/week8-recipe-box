@@ -196,7 +196,7 @@ def _scale_ingredient(ingredient: str, factor: float) -> str:
     try:
         quantity, end = _scale_number(ingredient, lead, factor_decimal, context)
         separator = _SEPARATOR_RE.match(ingredient, end)
-        if separator is not None and _NUMBER_START_RE.match(ingredient, separator.end()):
+        if separator is not None and _TOKEN_RE.match(ingredient, separator.end()):
             upper, end = _scale_number(ingredient, separator.end(), factor_decimal, context)
             quantity = f"{quantity}{separator[0]}{upper}"
     except ValueError:

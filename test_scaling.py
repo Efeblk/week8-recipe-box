@@ -169,11 +169,28 @@ def test_huge_integer_scales_exactly():
 
 
 def test_scale_route_exact_and_malformed(client):
-    rid = _create(client, ["12345678901 g", "1/2/3 cup", "1.2.3 g", "1-inch ginger"])
+    rid = _create(
+        client,
+        ["12345678901 g", "1/2/3 cup", "1.2.3 g", "1-/2 cup", "1-..5 cups", "1-inch ginger"],
+    )
     r = client.get(f"/recipes/{rid}/scaled", params={"factor": 1})
-    assert r.json()["ingredients"] == ["12345678901 g", "1/2/3 cup", "1.2.3 g", "1-inch ginger"]
+    assert r.json()["ingredients"] == [
+        "12345678901 g",
+        "1/2/3 cup",
+        "1.2.3 g",
+        "1-/2 cup",
+        "1-..5 cups",
+        "1-inch ginger",
+    ]
     r = client.get(f"/recipes/{rid}/scaled", params={"factor": 2})
-    assert r.json()["ingredients"] == ["24691357802 g", "1/2/3 cup", "1.2.3 g", "2-inch ginger"]
+    assert r.json()["ingredients"] == [
+        "24691357802 g",
+        "1/2/3 cup",
+        "1.2.3 g",
+        "1-/2 cup",
+        "1-..5 cups",
+        "2-inch ginger",
+    ]
 
 
 def test_scale_tests_use_isolated_database(client, tmp_path):
