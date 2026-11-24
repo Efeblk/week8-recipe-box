@@ -11,11 +11,12 @@ Test:
     pytest
 """
 import json
+import re
 import sqlite3
 from contextlib import closing
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
@@ -101,6 +102,42 @@ def get_recipe(recipe_id: int):
     if row is None:
         raise HTTPException(status_code=404, detail="unknown recipe")
     return _row_to_recipe(row)
+
+
+# Leading quantity: mixed number ("1 1/2"), fraction ("1/2") or decimal/integer ("200", "0.5").
+_QUANTITY_RE = re.compile(r"^(\s*)(\d+\s+\d+/\d+|\d+/\d+|\d+(?:\.\d+)?|\.\d+)")
+
+
+def _parse_quantity(text: str) -> float:
+    total = 0.0
+    for part in text.split():
+        if "/" in part:
+            num, den = part.split("/")
+            total += int(num) / int(den) if int(den) else 0.0
+        else:
+            total += float(part)
+    return total
+
+
+def _format_quantity(value: float) -> str:
+    rounded = round(value, 2)
+    return str(int(rounded)) if rounded == int(rounded) else f"{rounded:g}"
+
+
+def _scale_ingredient(ingredient: str, factor: float) -> str:
+    """Scale the leading quantity of an ingredient, e.g. '200 g flour' -> '400 g flour'."""
+    match = _QUANTITY_RE.match(ingredient)
+    if match is None:
+        return ingredient
+    scaled = _format_quantity(_parse_quantity(match.group(2)) * factor)
+    return f"{match.group(1)}{scaled}{ingredient[match.end():]}"
+
+
+@app.get("/recipes/{recipe_id}/scaled")
+def get_scaled_recipe(recipe_id: int, factor: float = Query(gt=0, allow_inf_nan=False)):
+    recipe = get_recipe(recipe_id)
+    recipe["ingredients"] = [_scale_ingredient(i, factor) for i in recipe["ingredients"]]
+    return {**recipe, "factor": factor}
 
 
 def _parse_recipe_ids(ids: str) -> list[int]:
