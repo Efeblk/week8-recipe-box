@@ -11,11 +11,10 @@ Test:
     pytest
 """
 import json
-import math
 import re
 import sqlite3
 from contextlib import closing
-from decimal import Decimal
+from decimal import MAX_EMAX, MIN_EMIN, Context, Decimal, Inexact
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query
@@ -110,60 +109,99 @@ def get_recipe(recipe_id: int):
 MIN_SCALE_FACTOR = 0.001
 MAX_SCALE_FACTOR = 1000
 
-# A single quantity: mixed number ("1 1/2"), fraction ("1/2") or decimal/integer ("200", "0.5", ".5").
-# ASCII digits only, so lookalike Unicode digits are left alone.
-_NUMBER = r"[0-9]+\s+[0-9]+/[0-9]+|[0-9]+/[0-9]+|[0-9]+(?:\.[0-9]+)?|\.[0-9]+"
-# Leading quantity, optionally a range ("2-3", "1 – 2") with a hyphen, en dash or em dash.
-_QUANTITY_RE = re.compile(
-    rf"^(?P<lead>\s*)(?P<first>{_NUMBER})(?:(?P<sep>\s*[-–—]\s*)(?P<second>{_NUMBER}))?"
-)
+# Quantities are parsed as whole tokens and computed with exact Decimal arithmetic, so there is
+# no float rounding, overflow or underflow. ASCII digits only; lookalike Unicode digits are left alone.
+_LEAD_RE = re.compile(r"\s*")
+_SEPARATOR_RE = re.compile(r"\s*[-–—]\s*")  # range delimiter: hyphen, en dash or em dash
+_NUMBER_START_RE = re.compile(r"[0-9]|\.[0-9]")
+_TOKEN_RE = re.compile(r"[0-9./]+")  # a maximal run of numeric characters
+_INTEGER_RE = re.compile(r"[0-9]+")
+_DECIMAL_RE = re.compile(r"[0-9]+(?:\.[0-9]+)?|\.[0-9]+")
+_FRACTION_RE = re.compile(r"([0-9]+)/([0-9]+)")
+_WHITESPACE_RE = re.compile(r"\s+")
+
+# Results that are not exact (e.g. 1/3) are shown with this many significant digits.
+_DISPLAY_CONTEXT = Context(prec=10, Emin=MIN_EMIN, Emax=MAX_EMAX, traps=[])
 
 
-def _parse_quantity(text: str) -> float | None:
-    """Parse '200', '0.5', '1/2' or '1 1/2' to a float; None if malformed (e.g. '1/0')."""
-    total = 0.0
-    for part in text.split():
-        if "/" in part:
-            num, den = part.split("/")
-            if float(den) == 0:
-                return None
-            total += float(num) / float(den)
-        else:
-            total += float(part)
-    return total
+def _read_fraction(token: str, context: Context) -> Decimal:
+    """Parse 'n/d'; ValueError if the token is not exactly that or the denominator is zero."""
+    match = _FRACTION_RE.fullmatch(token)
+    if match is None:
+        raise ValueError(f"malformed fraction {token!r}")
+    denominator = Decimal(match[2])
+    if denominator == 0:
+        raise ValueError(f"zero denominator in {token!r}")
+    return context.divide(Decimal(match[1]), denominator)
 
 
-def _format_quantity(value: float) -> str:
-    """Render without exponent, float noise or trailing zeros: 0.30000000000000004 -> '0.3'."""
-    text = format(Decimal(f"{value:.10g}"), "f")
+def _read_number(text: str, pos: int, context: Context) -> tuple[Decimal, int]:
+    """Read one quantity at `pos`: integer, decimal ('.5'), fraction ('1/2') or mixed ('1 1/2').
+
+    Returns the exact value and the end position. The whole numeric token must be valid:
+    anything malformed ('1/2/3', '1.2.3', '1/', '1/0') raises ValueError.
+    """
+    match = _TOKEN_RE.match(text, pos)
+    if match is None:
+        raise ValueError("no number")
+    token, end = match[0], match.end()
+    if "/" in token:
+        return _read_fraction(token, context), end
+    if _INTEGER_RE.fullmatch(token):
+        # Mixed number: whole part, whitespace, then a fraction-looking token.
+        space = _WHITESPACE_RE.match(text, end)
+        if space is not None:
+            tail = _TOKEN_RE.match(text, space.end())
+            if tail is not None and "/" in tail[0]:
+                fraction = _read_fraction(tail[0], context)
+                return context.add(Decimal(token), fraction), tail.end()
+        return Decimal(token), end
+    if _DECIMAL_RE.fullmatch(token):
+        return Decimal(token), end
+    raise ValueError(f"malformed number {token!r}")
+
+
+def _format_quantity(value: Decimal, exact: bool) -> str:
+    """Render without exponent or trailing zeros. Inexact values are rounded for display."""
+    if not exact:
+        value = _DISPLAY_CONTEXT.plus(value)
+    text = format(value, "f")
     return text.rstrip("0").rstrip(".") if "." in text else text
 
 
-def _scale_quantity(text: str, factor: float) -> str | None:
-    """Scale one quantity string and format it; None if it cannot be scaled safely."""
-    quantity = _parse_quantity(text)
-    if quantity is None:
-        return None
-    scaled = quantity * factor
-    return _format_quantity(scaled) if math.isfinite(scaled) else None
+def _scale_number(text: str, pos: int, factor: Decimal, context: Context) -> tuple[str, int]:
+    """Read the quantity at `pos`, multiply it by `factor` and format it. Raises ValueError."""
+    context.clear_flags()
+    value, end = _read_number(text, pos, context)
+    scaled = context.multiply(value, factor)
+    return _format_quantity(scaled, exact=not context.flags[Inexact]), end
 
 
 def _scale_ingredient(ingredient: str, factor: float) -> str:
     """Scale the leading quantity (or range) of an ingredient, e.g. '2-3 eggs' -> '4-6 eggs'.
 
     Ingredients without a leading quantity, or with a malformed one such as '1/0 cup',
-    are returned unchanged.
+    '1/2/3 cup' or '1.2.3 g', are returned unchanged. Attached units ('200g') and hyphenated
+    descriptors ('1-inch ginger', '2 8-oz cans') are preserved as suffix text.
     """
-    match = _QUANTITY_RE.match(ingredient)
-    if match is None:
+    lead = _LEAD_RE.match(ingredient).end()
+    if _NUMBER_START_RE.match(ingredient, lead) is None:
         return ingredient
-    scaled = [_scale_quantity(match["first"], factor)]
-    if match["second"] is not None:
-        scaled.append(_scale_quantity(match["second"], factor))
-    if None in scaled:
+    factor_text = repr(factor)
+    factor_decimal = Decimal(factor_text)
+    # Enough digits that every product is exact; only divisions (fractions) can round.
+    context = Context(
+        prec=len(ingredient) + len(factor_text) + 60, Emin=MIN_EMIN, Emax=MAX_EMAX, traps=[]
+    )
+    try:
+        quantity, end = _scale_number(ingredient, lead, factor_decimal, context)
+        separator = _SEPARATOR_RE.match(ingredient, end)
+        if separator is not None and _NUMBER_START_RE.match(ingredient, separator.end()):
+            upper, end = _scale_number(ingredient, separator.end(), factor_decimal, context)
+            quantity = f"{quantity}{separator[0]}{upper}"
+    except ValueError:
         return ingredient
-    quantity = (match["sep"] or "").join(scaled)
-    return f"{match['lead']}{quantity}{ingredient[match.end():]}"
+    return f"{ingredient[:lead]}{quantity}{ingredient[end:]}"
 
 
 @app.get("/recipes/{recipe_id}/scaled")
